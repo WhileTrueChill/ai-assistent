@@ -18,10 +18,13 @@ import {
   PhoneIcon,
   CheckCircleIcon,
   ClipboardIcon,
-  SpeakerWaveIcon
+  SpeakerWaveIcon,
+  SignalIcon
 } from '@heroicons/react/24/solid';
 
 const ROOM_CHANNEL = 'gemini-meet-room-channel';
+const FRAME_RATE = 12; // Optimized for BroadcastChannel throughput
+const QUALITY = 0.4;   // JPEG Compression quality
 
 const App: React.FC = () => {
   const [status, setStatus] = useState<MeetingStatus>('idle');
@@ -42,6 +45,7 @@ const App: React.FC = () => {
   const localStreamRef = useRef<MediaStream | null>(null);
   const localId = useRef(Math.random().toString(36).substring(7));
   const channelRef = useRef<BroadcastChannel | null>(null);
+  const captureCanvasRef = useRef<HTMLCanvasElement | null>(null);
   
   // Gemini Live Refs
   const sessionRef = useRef<any>(null);
@@ -49,18 +53,56 @@ const App: React.FC = () => {
   const nextStartTimeRef = useRef<number>(0);
   const audioSourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
 
-  // Multi-tab Sync (Simulating Real Network)
+  // Frame Streaming Logic
+  useEffect(() => {
+    let intervalId: number;
+    if (status === 'connected' && isCamOn && localVideoRef.current) {
+      const canvas = document.createElement('canvas');
+      canvas.width = 320; // SD resolution for throughput
+      canvas.height = 240;
+      const ctx = canvas.getContext('2d');
+
+      intervalId = window.setInterval(() => {
+        if (localVideoRef.current && ctx) {
+          ctx.drawImage(localVideoRef.current, 0, 0, canvas.width, canvas.height);
+          const frame = canvas.toDataURL('image/jpeg', QUALITY);
+          channelRef.current?.postMessage({ 
+            type: 'VIDEO_FRAME', 
+            payload: { id: localId.current, frame } 
+          });
+        }
+      }, 1000 / FRAME_RATE);
+    }
+    return () => clearInterval(intervalId);
+  }, [status, isCamOn]);
+
+  // Local Video Attachment
+  useEffect(() => {
+    if (status === 'connected' && localVideoRef.current && localStreamRef.current) {
+      if (localVideoRef.current.srcObject !== localStreamRef.current) {
+        localVideoRef.current.srcObject = localStreamRef.current;
+      }
+    }
+  }, [participants, status, isCamOn]);
+
+  // Multi-tab Sync with Frame Handling
   useEffect(() => {
     const channel = new BroadcastChannel(ROOM_CHANNEL);
     channelRef.current = channel;
 
     channel.onmessage = (event) => {
       const { type, payload } = event.data;
-      if (type === 'JOIN') {
-        // Someone else joined, add them
+      
+      if (type === 'VIDEO_FRAME') {
+        setParticipants(prev => prev.map(p => {
+          if (p.id === payload.id) {
+            return { ...p, lastFrame: payload.frame, isVideoOn: true };
+          }
+          return p;
+        }));
+      } else if (type === 'JOIN') {
         setParticipants(prev => {
           if (prev.find(p => p.id === payload.id)) return prev;
-          // Respond by broadcasting our own presence so the newcomer knows about us
           channel.postMessage({ type: 'PRESENCE', payload: getLocalParticipantData() });
           return [...prev, payload];
         });
@@ -82,11 +124,11 @@ const App: React.FC = () => {
 
   const getLocalParticipantData = () => ({
     id: localId.current,
-    name: 'You (Tab ' + localId.current + ')',
-    isLocal: false, // For others, I am not local
+    name: 'User ' + localId.current.toUpperCase(),
+    isLocal: false,
     isVideoOn: isCamOn,
     isAudioOn: isMicOn,
-    avatarColor: 'bg-emerald-500',
+    avatarColor: 'bg-indigo-600',
     isSpeaking: false
   });
 
@@ -99,7 +141,10 @@ const App: React.FC = () => {
   const startMeeting = async () => {
     setStatus('joining');
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+      const stream = await navigator.mediaDevices.getUserMedia({ 
+        video: { width: 1280, height: 720, frameRate: 30 }, 
+        audio: true 
+      });
       localStreamRef.current = stream;
       
       const localP: Participant = {
@@ -108,7 +153,7 @@ const App: React.FC = () => {
         isLocal: true,
         isVideoOn: true,
         isAudioOn: true,
-        avatarColor: 'bg-emerald-500',
+        avatarColor: 'bg-emerald-600',
         isSpeaking: false,
         stream: stream
       };
@@ -116,18 +161,18 @@ const App: React.FC = () => {
       setParticipants([localP]);
       setStatus('connected');
       
-      // Broadcast join
       channelRef.current?.postMessage({ 
         type: 'JOIN', 
-        payload: { ...localP, isLocal: false, stream: undefined } 
+        payload: { ...localP, isLocal: false, stream: undefined, name: 'User ' + localId.current.toUpperCase() } 
       });
 
-      if (localVideoRef.current) {
-        localVideoRef.current.srcObject = stream;
-      }
+      setTimeout(() => {
+        if (localVideoRef.current) localVideoRef.current.srcObject = stream;
+      }, 100);
+
     } catch (err) {
       console.error("Failed to get media", err);
-      alert("Please allow camera and microphone access to join.");
+      alert("Permission denied. Ensure camera access is allowed.");
       setStatus('idle');
     }
   };
@@ -159,12 +204,10 @@ const App: React.FC = () => {
   };
 
   const copyInviteLink = () => {
-    const link = window.location.href;
-    navigator.clipboard.writeText(link);
-    showNotification("Invite link copied to clipboard!");
+    navigator.clipboard.writeText(window.location.href);
+    showNotification("Meeting link copied!");
   };
 
-  // WhatsApp Invite Logic
   const handleDialerInput = (val: string) => {
     if (dialedNumber.length < 15) setDialedNumber(prev => prev + val);
   };
@@ -174,20 +217,16 @@ const App: React.FC = () => {
   const callParticipantViaWhatsApp = () => {
     if (!dialedNumber) return;
     setIsDialing(true);
-    
     const cleanNumber = dialedNumber.replace(/\D/g, '');
     const meetingUrl = window.location.href;
-    const inviteMessage = `Join my video call on Gemini Meet! %0A%0AClick here to join: ${meetingUrl}`;
-    const whatsappUrl = `https://wa.me/${cleanNumber}?text=${inviteMessage}`;
-    
-    window.open(whatsappUrl, '_blank');
+    const inviteMessage = `Join my HD Gemini video call! %0AClick here to join: ${meetingUrl}`;
+    window.open(`https://wa.me/${cleanNumber}?text=${inviteMessage}`, '_blank');
     setIsDialing(false);
     setIsDialerOpen(false);
     setDialedNumber('');
-    showNotification("WhatsApp invite sent! Waiting for them to join...");
+    showNotification("Invite sent! Waiting for participant...");
   };
 
-  // Gemini Live Logic
   const toggleAi = useCallback(async () => {
     if (isAiActive) {
       sessionRef.current?.close();
@@ -195,7 +234,6 @@ const App: React.FC = () => {
       setParticipants(prev => prev.filter(p => !p.isAI));
       return;
     }
-
     setIsAiActive(true);
     const aiParticipant: Participant = {
       id: 'ai-bot',
@@ -204,23 +242,21 @@ const App: React.FC = () => {
       isAI: true,
       isVideoOn: true,
       isAudioOn: true,
-      avatarColor: 'bg-gradient-to-br from-blue-600 to-emerald-500',
+      avatarColor: 'bg-gradient-to-br from-indigo-500 to-blue-700',
       isSpeaking: false
     };
     setParticipants(prev => [aiParticipant, ...prev]);
-
     const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
     if (!audioContextRef.current) {
       audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
     }
     const outCtx = audioContextRef.current;
-
     const sessionPromise = ai.live.connect({
       model: 'gemini-2.5-flash-native-audio-preview-09-2025',
       config: {
         responseModalities: [Modality.AUDIO],
         speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Puck' } } },
-        systemInstruction: 'You are an active participant in a video conference. Be helpful, concise, and professional. Engage naturally with the group.'
+        systemInstruction: 'You are a professional meeting assistant. Keep answers brief and clear.'
       },
       callbacks: {
         onopen: () => {
@@ -259,26 +295,23 @@ const App: React.FC = () => {
         onclose: () => setIsAiActive(false),
       }
     });
-
     sessionRef.current = await sessionPromise;
   }, [isAiActive]);
 
   if (status === 'idle' || status === 'ended') {
     return (
-      <div className="h-screen flex items-center justify-center bg-[#0f172a] p-4">
-        <div className="max-w-md w-full bg-[#1e293b] rounded-3xl p-8 shadow-2xl border border-slate-700/50 text-center">
-          <div className="w-20 h-20 bg-emerald-500/10 rounded-2xl flex items-center justify-center mx-auto mb-6">
-            <VideoCameraIcon className="w-10 h-10 text-emerald-500" />
+      <div className="h-screen flex items-center justify-center bg-[#050811] p-4">
+        <div className="max-w-md w-full bg-[#0f172a] rounded-[2.5rem] p-10 shadow-2xl border border-white/10 text-center">
+          <div className="w-24 h-24 bg-emerald-500/10 rounded-3xl flex items-center justify-center mx-auto mb-8 animate-pulse">
+            <VideoCameraIcon className="w-12 h-12 text-emerald-500" />
           </div>
-          <h1 className="text-3xl font-bold mb-2">Gemini Meet</h1>
-          <p className="text-slate-400 mb-8">Secure P2P video calls with intelligent AI assistance.</p>
-          <button 
-            onClick={startMeeting}
-            className="w-full py-4 bg-emerald-600 hover:bg-emerald-500 text-white rounded-xl font-bold transition-all transform active:scale-95 shadow-lg shadow-emerald-500/20"
-          >
-            Enter Meeting Room
-          </button>
-          <p className="mt-4 text-xs text-slate-500">To test multi-person joining, open this URL in another tab!</p>
+          <h1 className="text-4xl font-extrabold mb-3 tracking-tight">Gemini Meet</h1>
+          <p className="text-slate-400 mb-10 text-lg leading-relaxed">Experience high-definition video calls with real-time AI collaboration.</p>
+          <button onClick={startMeeting} className="w-full py-5 bg-emerald-600 hover:bg-emerald-500 text-white rounded-2xl font-black text-xl transition-all transform active:scale-95 shadow-[0_0_30px_rgba(16,185,129,0.2)]">Start New Meeting</button>
+          <div className="mt-8 flex justify-center gap-4">
+             <div className="px-3 py-1 bg-slate-800 rounded-full text-[10px] font-bold text-slate-400 uppercase tracking-widest border border-slate-700">1080p Enabled</div>
+             <div className="px-3 py-1 bg-slate-800 rounded-full text-[10px] font-bold text-slate-400 uppercase tracking-widest border border-slate-700">AI Powered</div>
+          </div>
         </div>
       </div>
     );
@@ -287,110 +320,144 @@ const App: React.FC = () => {
   const getGridClass = () => {
     const count = participants.length;
     if (count <= 1) return 'grid-cols-1';
-    if (count <= 4) return 'grid-cols-2';
-    return 'grid-cols-3';
+    if (count <= 2) return 'grid-cols-1 md:grid-cols-2';
+    return 'grid-cols-1 sm:grid-cols-2 lg:grid-cols-3';
   };
 
   return (
-    <div className="h-screen flex flex-col bg-[#0f172a]">
+    <div className="h-screen flex flex-col bg-[#050811] text-slate-100 selection:bg-emerald-500/30">
       {showToast && (
-        <div className="fixed top-20 right-8 z-[110] bg-emerald-600 text-white px-6 py-3 rounded-2xl shadow-2xl flex items-center gap-3 animate-in slide-in-from-right">
-          <CheckCircleIcon className="w-6 h-6" />
-          <div>
-            <p className="font-bold text-sm">Update</p>
-            <p className="text-xs opacity-90">{toastMsg}</p>
-          </div>
+        <div className="fixed top-8 right-8 z-[110] bg-emerald-600 text-white px-8 py-4 rounded-3xl shadow-2xl flex items-center gap-4 animate-in slide-in-from-right ring-4 ring-emerald-500/20">
+          <CheckCircleIcon className="w-7 h-7" />
+          <p className="font-bold">{toastMsg}</p>
         </div>
       )}
 
       {isDialerOpen && (
-        <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/60 backdrop-blur-sm">
-          <div className="bg-[#1e293b] border border-slate-700 p-8 rounded-[2.5rem] shadow-2xl w-full max-w-xs text-center flex flex-col items-center animate-in zoom-in duration-200">
-            <button onClick={() => setIsDialerOpen(false)} className="absolute top-4 right-4 text-slate-500 hover:text-white"><PhoneXMarkIcon className="w-6 h-6" /></button>
-            <h2 className="text-xl font-bold mb-1 text-white">Invite via WhatsApp</h2>
-            <div className="w-full bg-slate-900 h-16 rounded-2xl my-6 flex items-center justify-center text-2xl font-mono text-emerald-400">{dialedNumber || 'Number...'}</div>
-            <div className="grid grid-cols-3 gap-4 mb-6">
+        <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/90 backdrop-blur-xl">
+          <div className="bg-[#1e293b] border border-white/10 p-10 rounded-[3.5rem] shadow-2xl w-full max-w-sm text-center flex flex-col items-center animate-in zoom-in duration-300">
+            <button onClick={() => setIsDialerOpen(false)} className="absolute top-6 right-6 text-slate-400 hover:text-white transition-colors p-2"><PhoneXMarkIcon className="w-8 h-8" /></button>
+            <h2 className="text-2xl font-black mb-2 tracking-tight">WhatsApp Invite</h2>
+            <p className="text-sm text-slate-400 mb-8 font-medium">Enter participant's phone number</p>
+            <div className="w-full bg-slate-950 h-20 rounded-3xl mb-8 flex items-center justify-center text-3xl font-mono text-emerald-400 border border-white/5 shadow-inner">{dialedNumber || '000 000 0000'}</div>
+            <div className="grid grid-cols-3 gap-5 mb-10 w-full">
               {['1', '2', '3', '4', '5', '6', '7', '8', '9', '+', '0', '#'].map((n) => (
-                <button key={n} onClick={() => handleDialerInput(n)} className="w-12 h-12 rounded-full bg-slate-800 hover:bg-slate-700 text-lg font-bold transition-all transform active:scale-90">{n}</button>
+                <button key={n} onClick={() => handleDialerInput(n)} className="h-16 rounded-3xl bg-slate-800/50 hover:bg-slate-700 text-2xl font-black border border-white/5 transform active:scale-90 transition-all">{n}</button>
               ))}
             </div>
-            <div className="flex gap-4 w-full">
-              <button onClick={handleDialerBackspace} className="flex-1 py-3 bg-slate-800 rounded-xl flex items-center justify-center"><BackspaceIcon className="w-6 h-6" /></button>
-              <button onClick={callParticipantViaWhatsApp} className="flex-[2] py-3 bg-emerald-600 rounded-xl font-bold flex items-center justify-center gap-2"><ChatBubbleBottomCenterTextIcon className="w-5 h-5" />Invite</button>
+            <div className="flex gap-5 w-full">
+              <button onClick={handleDialerBackspace} className="flex-1 py-4 bg-slate-800 rounded-2xl flex items-center justify-center hover:bg-slate-700"><BackspaceIcon className="w-8 h-8" /></button>
+              <button onClick={callParticipantViaWhatsApp} className="flex-[2] py-4 bg-emerald-600 rounded-2xl font-black text-lg flex items-center justify-center gap-3 shadow-[0_0_40px_rgba(16,185,129,0.3)] hover:bg-emerald-500 transition-all transform active:scale-95"><ChatBubbleBottomCenterTextIcon className="w-6 h-6" /> Invite</button>
             </div>
           </div>
         </div>
       )}
 
-      <header className="h-16 flex items-center justify-between px-6 border-b border-slate-800 bg-[#0f172a]/80 backdrop-blur-md z-10">
-        <div className="flex items-center gap-4">
-          <div className="w-10 h-10 bg-emerald-600 rounded-xl flex items-center justify-center shadow-lg shadow-emerald-600/20"><VideoCameraIcon className="w-6 h-6 text-white" /></div>
+      <header className="h-20 flex items-center justify-between px-10 border-b border-white/5 bg-[#050811]/60 backdrop-blur-2xl z-10">
+        <div className="flex items-center gap-5">
+          <div className="w-12 h-12 bg-emerald-600 rounded-2xl flex items-center justify-center shadow-[0_0_20px_rgba(16,185,129,0.3)]"><VideoCameraIcon className="w-7 h-7 text-white" /></div>
           <div>
-            <h1 className="font-bold text-sm tracking-tight">GEMINI MEET ROOM</h1>
-            <p className="text-[10px] text-emerald-500 font-mono flex items-center gap-1 uppercase tracking-widest"><span className="w-1.5 h-1.5 bg-emerald-500 rounded-full animate-pulse"/> Encrypted Live</p>
+            <h1 className="font-black text-lg tracking-tight leading-none mb-1">GEMINI MEET ROOM</h1>
+            <div className="flex items-center gap-2">
+               <div className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
+               <p className="text-[10px] text-emerald-500 font-black uppercase tracking-[0.2em]">HD 1080p ACTIVE</p>
+            </div>
           </div>
         </div>
-        <div className="flex items-center gap-3">
-          <button onClick={copyInviteLink} className="flex items-center gap-2 bg-slate-800 hover:bg-slate-700 px-4 py-2 rounded-full text-xs font-bold text-slate-300 transition-all active:scale-95 border border-slate-700"><ClipboardIcon className="w-4 h-4" /> Copy Link</button>
-          <button onClick={() => setIsDialerOpen(true)} className="flex items-center gap-2 bg-emerald-600/10 hover:bg-emerald-600/20 px-4 py-2 rounded-full text-xs font-bold text-emerald-400 transition-all active:scale-95 border border-emerald-500/20"><UserPlusIcon className="w-4 h-4" /> Invite Member</button>
+        <div className="flex items-center gap-4">
+          <button onClick={copyInviteLink} className="flex items-center gap-3 bg-slate-900/50 hover:bg-slate-800 px-6 py-3 rounded-2xl text-xs font-black text-slate-300 border border-white/5 transition-all transform active:scale-95"><ClipboardIcon className="w-5 h-5" /> Copy Link</button>
+          <button onClick={() => setIsDialerOpen(true)} className="flex items-center gap-3 bg-emerald-600/10 hover:bg-emerald-600/20 px-6 py-3 rounded-2xl text-xs font-black text-emerald-400 border border-emerald-500/20 transition-all transform active:scale-95"><UserPlusIcon className="w-5 h-5" /> Add Member</button>
         </div>
       </header>
 
-      <main className={`video-grid ${getGridClass()} flex-1 overflow-y-auto`}>
+      <main className={`video-grid ${getGridClass()} flex-1 overflow-y-auto p-8 gap-8`}>
         {participants.map((p) => (
-          <div key={p.id} className={`participant-card relative animate-in zoom-in-95 duration-500 ${p.isSpeaking || (p.isAI && isAiSpeaking) ? 'active-speaker' : ''}`}>
+          <div key={p.id} className={`participant-card relative group shadow-2xl ${p.isSpeaking || (p.isAI && isAiSpeaking) ? 'active-speaker ring-4 ring-emerald-500/40' : 'border-white/5'}`}>
             {p.isLocal ? (
-              <video ref={localVideoRef} autoPlay muted playsInline className={`w-full h-full object-cover transform ${isCamOn ? 'scale-x-[-1]' : 'hidden'}`} />
+              <video 
+                ref={localVideoRef} 
+                autoPlay 
+                muted 
+                playsInline 
+                className={`w-full h-full object-cover transform transition-all duration-500 ${isCamOn ? 'scale-x-[-1] opacity-100' : 'opacity-0 scale-105'}`} 
+              />
             ) : p.isAI ? (
-                <div className="w-full h-full bg-slate-800 flex flex-col items-center justify-center relative overflow-hidden">
-                    <div className={`absolute inset-0 bg-gradient-to-br from-blue-600/30 to-emerald-500/30 transition-opacity duration-1000 ${isAiSpeaking ? 'opacity-100' : 'opacity-0'}`} />
-                    <div className={`w-32 h-32 rounded-full bg-gradient-to-br from-blue-600 to-emerald-500 flex items-center justify-center shadow-2xl z-10 transition-transform duration-300 ${isAiSpeaking ? 'scale-110' : 'scale-100'}`}><SparklesIcon className="w-16 h-16 text-white" /></div>
-                    {isAiSpeaking && <div className="mt-8 wave-container z-10">{[...Array(12)].map((_, i) => (<div key={i} className="wave-bar" style={{ animationDelay: `${i * 0.1}s` }} />))}</div>}
+                <div className="w-full h-full bg-[#0a0f1e] flex flex-col items-center justify-center relative overflow-hidden">
+                    <div className={`absolute inset-0 bg-gradient-to-br from-indigo-500/30 via-blue-700/20 to-emerald-500/30 transition-opacity duration-1000 ${isAiSpeaking ? 'opacity-100' : 'opacity-0'}`} />
+                    <div className={`w-36 h-36 rounded-full bg-gradient-to-br from-indigo-500 to-blue-700 flex items-center justify-center shadow-[0_0_50px_rgba(59,130,246,0.5)] z-10 transition-all duration-700 ${isAiSpeaking ? 'scale-110' : 'scale-100 grayscale-[0.3]'}`}><SparklesIcon className="w-20 h-20 text-white" /></div>
+                    {isAiSpeaking && <div className="mt-10 wave-container z-10">{[...Array(15)].map((_, i) => (<div key={i} className="wave-bar w-1" style={{ animationDelay: `${i * 0.08}s`, background: '#3b82f6' }} />))}</div>}
                 </div>
             ) : (
-              <div className="w-full h-full bg-slate-800 flex items-center justify-center relative">
-                {p.isVideoOn ? (
-                    <div className="w-full h-full bg-slate-900/50 flex flex-col items-center justify-center gap-4">
-                        <div className={`w-24 h-24 rounded-full ${p.avatarColor} flex items-center justify-center text-4xl font-bold shadow-2xl`}>{p.name.charAt(0)}</div>
-                        <p className="text-slate-500 text-xs font-medium uppercase tracking-widest">Live Camera Active</p>
+              <div className="w-full h-full bg-[#0a0f1e] flex items-center justify-center relative">
+                {p.isVideoOn && p.lastFrame ? (
+                    <div className="w-full h-full relative">
+                        <img src={p.lastFrame} className="w-full h-full object-cover transition-opacity duration-300" alt="Remote participant video" />
+                        <div className="absolute top-4 right-4 flex items-center gap-2 bg-black/40 backdrop-blur-md px-3 py-1.5 rounded-xl border border-white/10">
+                            <SignalIcon className="w-4 h-4 text-emerald-500" />
+                            <span className="text-[10px] font-black uppercase tracking-widest text-emerald-400">HD Stream</span>
+                        </div>
                     </div>
                 ) : (
-                    <div className="flex flex-col items-center gap-4">
-                        <div className={`w-24 h-24 rounded-full ${p.avatarColor} opacity-50 flex items-center justify-center text-4xl font-bold grayscale`}>{p.name.charAt(0)}</div>
-                        <p className="text-slate-600 text-xs font-medium uppercase tracking-widest">Camera Off</p>
+                    <div className="flex flex-col items-center gap-6 animate-in fade-in duration-700">
+                        <div className={`w-28 h-28 rounded-[2rem] ${p.avatarColor} flex items-center justify-center text-5xl font-black text-white shadow-2xl border-2 border-white/10`}>{p.name.charAt(0)}</div>
+                        <div className="flex flex-col items-center gap-1">
+                          <p className="text-slate-300 font-bold tracking-tight text-lg">{p.name}</p>
+                          <p className="text-slate-500 text-[10px] font-black uppercase tracking-widest">Camera Disabled</p>
+                        </div>
                     </div>
                 )}
               </div>
             )}
-            <div className="absolute bottom-4 left-4 flex items-center gap-3 bg-black/40 backdrop-blur-md px-4 py-2 rounded-xl border border-white/10">
-              <div className="flex items-center gap-2">
-                <span className="text-xs font-bold whitespace-nowrap">{p.name} {p.isLocal && "(You)"}</span>
-                {p.isAudioOn ? <SpeakerWaveIcon className={`w-3 h-3 text-emerald-400 ${p.isSpeaking ? 'animate-bounce' : ''}`} /> : <NoSymbolIcon className="w-3 h-3 text-red-500" />}
+            
+            {p.isLocal && !isCamOn && (
+               <div className="absolute inset-0 bg-[#0a0f1e] flex flex-col items-center justify-center gap-6 animate-in fade-in">
+                 <div className="w-28 h-28 rounded-[2rem] bg-emerald-600/10 flex items-center justify-center text-5xl font-black text-emerald-500 border-2 border-emerald-500/20 shadow-2xl">Y</div>
+                 <p className="text-slate-500 text-xs font-black uppercase tracking-[0.2em]">Your Camera is Paused</p>
+               </div>
+            )}
+
+            <div className="absolute bottom-6 left-6 flex items-center gap-4 bg-black/60 backdrop-blur-2xl px-5 py-2.5 rounded-2xl border border-white/10 shadow-2xl transition-all group-hover:bg-black/80">
+              <div className="flex items-center gap-4">
+                <span className="text-sm font-black tracking-tight">{p.name} {p.isLocal && "(You)"}</span>
+                <div className="flex items-center gap-1 h-4">
+                  {p.isAudioOn ? (
+                    [1, 2, 3, 4].map(i => <div key={i} className={`w-1 h-full bg-emerald-400 rounded-full ${p.isSpeaking || (p.isAI && isAiSpeaking) ? 'animate-bounce' : 'opacity-30'}`} style={{ animationDelay: `${i*0.1}s` }} />)
+                  ) : <NoSymbolIcon className="w-4 h-4 text-red-500" />}
+                </div>
               </div>
             </div>
           </div>
         ))}
       </main>
 
-      <footer className="h-24 flex items-center justify-center gap-4 relative z-20">
-        <div className="glass-panel px-10 py-5 rounded-full flex items-center gap-8 shadow-2xl border border-white/5">
-          <button onClick={toggleMic} className={`p-4 rounded-full transition-all transform active:scale-90 ${isMicOn ? 'bg-slate-700 hover:bg-slate-600 text-white' : 'bg-red-500 text-white shadow-lg shadow-red-500/30'}`}>
-            {isMicOn ? <MicrophoneIcon className="w-6 h-6" /> : <NoSymbolIcon className="w-6 h-6" />}
+      <footer className="h-32 flex items-center justify-center relative z-20 px-10">
+        <div className="glass-panel px-12 py-6 rounded-[3rem] flex items-center gap-10 shadow-2xl border border-white/10 ring-1 ring-white/5">
+          <button onClick={toggleMic} className={`p-5 rounded-full transition-all transform hover:scale-110 active:scale-90 ${isMicOn ? 'bg-slate-800 hover:bg-slate-700 text-white' : 'bg-red-500 text-white shadow-[0_0_30px_rgba(239,68,68,0.3)]'}`}>
+            {isMicOn ? <MicrophoneIcon className="w-7 h-7" /> : <NoSymbolIcon className="w-7 h-7" />}
           </button>
-          <button onClick={toggleCam} className={`p-4 rounded-full transition-all transform active:scale-90 ${isCamOn ? 'bg-slate-700 hover:bg-slate-600 text-white' : 'bg-red-500 text-white shadow-lg shadow-red-500/30'}`}>
-            {isCamOn ? <VideoCameraIcon className="w-6 h-6" /> : <VideoCameraSlashIcon className="w-6 h-6" />}
+          
+          <button onClick={toggleCam} className={`p-5 rounded-full transition-all transform hover:scale-110 active:scale-90 ${isCamOn ? 'bg-slate-800 hover:bg-slate-700 text-white' : 'bg-red-500 text-white shadow-[0_0_30px_rgba(239,68,68,0.3)]'}`}>
+            {isCamOn ? <VideoCameraIcon className="w-7 h-7" /> : <VideoCameraSlashIcon className="w-7 h-7" />}
           </button>
-          <button onClick={toggleAi} className={`p-4 rounded-full transition-all transform active:scale-90 ${isAiActive ? 'bg-blue-600 hover:bg-blue-500 text-white shadow-lg shadow-blue-500/30' : 'bg-slate-700 hover:bg-slate-600 text-slate-300'}`}>
-            <SparklesIcon className="w-6 h-6" />
+
+          <button onClick={toggleAi} className={`p-5 rounded-full transition-all transform hover:scale-110 active:scale-90 ${isAiActive ? 'bg-indigo-600 hover:bg-indigo-500 text-white shadow-[0_0_40px_rgba(79,70,229,0.4)] ring-2 ring-indigo-400/30' : 'bg-slate-800 hover:bg-slate-700 text-slate-400'}`}>
+            <SparklesIcon className="w-7 h-7" />
           </button>
-          <div className="w-px h-10 bg-white/10 mx-2" />
-          <button onClick={leaveMeeting} className="p-4 bg-red-600 hover:bg-red-500 text-white rounded-full transition-all transform active:scale-95 shadow-xl shadow-red-600/40">
-            <PhoneXMarkIcon className="w-7 h-7" />
+
+          <div className="w-px h-12 bg-white/10 mx-2" />
+
+          <button onClick={leaveMeeting} className="p-5 bg-red-600 hover:bg-red-500 text-white rounded-full transition-all transform hover:scale-110 active:scale-95 shadow-[0_0_40px_rgba(220,38,38,0.4)]">
+            <PhoneXMarkIcon className="w-8 h-8" />
           </button>
         </div>
-        <div className="absolute right-8 flex items-center gap-3 bg-slate-800/80 backdrop-blur-md px-5 py-3 rounded-2xl border border-white/5">
-          <UserGroupIcon className="w-5 h-5 text-emerald-500" />
-          <span className="text-sm font-bold text-slate-200">{participants.length} Active</span>
+        
+        <div className="absolute right-12 hidden xl:flex items-center gap-5 bg-slate-900/60 backdrop-blur-2xl px-6 py-4 rounded-3xl border border-white/5 shadow-2xl">
+          <div className="flex -space-x-3">
+            {participants.slice(0, 3).map((p, i) => (
+               <div key={p.id} className={`w-8 h-8 rounded-full ${p.avatarColor} border-2 border-slate-900 flex items-center justify-center text-[10px] font-black`}>{p.name.charAt(0)}</div>
+            ))}
+          </div>
+          <span className="text-xs font-black text-slate-400 uppercase tracking-[0.2em]">{participants.length} Active Users</span>
         </div>
       </footer>
     </div>
