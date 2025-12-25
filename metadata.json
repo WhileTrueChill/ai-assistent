@@ -1,0 +1,8 @@
+{
+  "name": "Gemini Meet",
+  "description": "Next-generation video conferencing with built-in Gemini Live AI integration.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ]
+}
